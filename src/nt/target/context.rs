@@ -173,7 +173,7 @@ impl Target {
         // and a process whose loader data is paged out, or which has exited
         // and lost its user address space, has none to list.
         let (symbol_report, modules_error) =
-            match guest.load_all_process_module_symbols(&self.phys, &self.symbols, &process_info) {
+            match guest.register_process_module_symbols(&self.symbols, &process_info) {
                 Ok(report) => (report, None),
                 Err(Error::MissingPEB) => (ModuleSymbolLoadReport::default(), None),
                 Err(error) => (ModuleSymbolLoadReport::default(), Some(error.to_string())),

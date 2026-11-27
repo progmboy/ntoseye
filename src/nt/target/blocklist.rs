@@ -16,6 +16,7 @@ use crate::base::disasm::function_extent;
 use crate::base::env;
 use crate::base::memory::MemoryOps;
 use crate::base::types::{CodeMachine, VirtAddr};
+use crate::nt::symbols::SymbolVisibility;
 use crate::nt::unwind::{ThreadTraceContext, function_range, resolve_thread_trace_context};
 
 /// The trap handlers a breakpoint or single-step trap enters, and the
@@ -95,6 +96,11 @@ const BREAKPOINT_BLOCKLIST: &[(&str, &str, Blocked)] = &[
         Blocked::TrapDispatch,
     ),
     ("nt", "KiDispatchException", Blocked::TrapDispatch),
+    // The roots of the x64 trap path. Checking them by name avoids reading
+    // their whole call graph for an ordinary, public-symbol breakpoint.
+    ("nt", "KiBreakpointTrap", Blocked::TrapDispatch),
+    ("nt", "KiDebugTrapOrFault", Blocked::TrapDispatch),
+    ("nt", "KiExceptionDispatch", Blocked::TrapDispatch),
 ];
 
 /// Whether `name` matches `pattern`, which may end in `*`.
@@ -162,6 +168,20 @@ impl Target {
     /// again, until the kernel stack overflows into a double fault. A single
     /// step there is taken: the trap flag is clear while the trap is
     /// dispatched.
+    /// Whether the closest symbol at `address` is a public (exported) PDB
+    /// symbol. Host-only; it reads no guest memory.
+    fn symbol_is_public(&self, address: VirtAddr) -> bool {
+        let dtb = self.kernel_dtb();
+        let Some((module, name, _)) = self.symbols.find_closest_symbol_for_address(dtb, address)
+        else {
+            return false;
+        };
+        self.symbols
+            .find_symbol_candidates(dtb, &format!("{module}!{name}"))
+            .iter()
+            .any(|candidate| matches!(candidate.visibility, SymbolVisibility::Public))
+    }
+
     pub fn breakpoint_site_refusal(&self, address: VirtAddr) -> Option<String> {
         if !blocklist_enabled() {
             return None;
@@ -170,6 +190,14 @@ impl Target {
             return Some(refusal);
         }
         let blocked = self.blocked(address).or_else(|| {
+            // The dispatch walk reads and decodes every function on the trap
+            // path, which over KD costs seconds. A public symbol names code
+            // the kernel itself exports, not one of the private trap-path
+            // helpers; those are still checked by the walk. Known debugger
+            // and dispatch roots are already in the list above.
+            if self.symbol_is_public(address) {
+                return None;
+            }
             let code = self
                 .guest
                 .as_ref()?

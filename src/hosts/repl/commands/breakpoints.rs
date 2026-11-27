@@ -232,6 +232,7 @@ fn set_breakpoint(
     #[arg(parse = code_breakpoint, name = "address|file:line")] args: ParsedBreakpointArgs,
 ) -> Result<BreakpointsSet> {
     let spec = args.target.clone();
+    let symbolic = args.clone();
     let config = state.breakpoint_config(args)?;
     let radix = state.ctx.radix;
     let address = match state
@@ -245,7 +246,10 @@ fn set_breakpoint(
         Err(_) if BreakpointSpec::source(&spec, 0).is_some() => {
             return set_source_breakpoint(state.ctx, spec, config);
         }
-        Err(error) => return Err(error),
+        // WinDbg's `bp` also takes a symbol and leaves it deferred until its
+        // module loads. `bu` already owns that path, including loading only
+        // the module named by the symbol.
+        Err(_) => return set_symbolic_breakpoint(state, symbolic),
     };
     let set = state.ctx.set_code_breakpoint(address, config)?;
     Ok(BreakpointsSet::Address {

@@ -38,6 +38,7 @@ const DEFAULT_MODULE_COMMAND: &str =
 const DEBUG_MODULE_USER_MODE: u64 = 0x2;
 const DEBUG_SYMTYPE_NONE: u64 = 0;
 const DEBUG_SYMTYPE_PDB: u64 = 3;
+const DEBUG_SYMTYPE_EXPORT: u64 = 4;
 const DEBUG_SYMTYPE_DEFERRED: u64 = 5;
 
 /// Run commands once for each token of a command's output, a string, or a file.
@@ -683,7 +684,10 @@ impl ModuleAliases<'_> {
             }),
             "@#SymbolType" => hex(match self.symbol_status {
                 Some(ModuleSymbolStatus::Loaded) => DEBUG_SYMTYPE_PDB,
-                Some(ModuleSymbolStatus::Fetching) => DEBUG_SYMTYPE_DEFERRED,
+                Some(ModuleSymbolStatus::Exports) => DEBUG_SYMTYPE_EXPORT,
+                Some(ModuleSymbolStatus::Deferred | ModuleSymbolStatus::Fetching) => {
+                    DEBUG_SYMTYPE_DEFERRED
+                }
                 _ => DEBUG_SYMTYPE_NONE,
             }),
             _ => return Ok(None),

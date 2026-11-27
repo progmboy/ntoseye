@@ -141,10 +141,14 @@ impl Session {
         scope: Option<&BreakpointScope>,
     ) -> Result<Option<String>> {
         let target = &self.target;
-        match BreakpointManager::resolve_symbol_in_scope(target, spec, scope)? {
+        let dtb = BreakpointManager::resolution_dtb(target, scope);
+        // Validate a symbol breakpoint without loading its module: an
+        // unresolved `bu mydriver!symbol` is deferred, exactly like WinDbg,
+        // rather than paying a symbol/PDB load for a breakpoint that may
+        // never be hit.
+        match BreakpointSpec::resolve_symbol_offset(target, dtb, spec)? {
             Some((_, 0)) => Ok(None),
-            Some((address, _)) => self
-                .check_instruction_start(BreakpointManager::resolution_dtb(target, scope), address),
+            Some((address, _)) => self.check_instruction_start(dtb, address),
             None => match BreakpointSpec::split_symbol_offset(spec) {
                 Some((symbol, offset)) if offset != 0 => Ok(Some(format!(
                     "{} does not resolve yet, so ntoseye could not check that an instruction starts \
@@ -198,9 +202,14 @@ impl Session {
             }
             let dtb = target.current_dtb();
             let names = match module {
-                Some((module, query)) => target
-                    .symbols
-                    .search_symbols_in_modules(dtb, module, query, limit),
+                Some((module, query)) => {
+                    if !matches!(scope, Some(BreakpointScope::Process { .. })) {
+                        let _ = target.load_current_module_symbols(module);
+                    }
+                    target
+                        .symbols
+                        .search_symbols_in_modules(dtb, module, query, limit)
+                }
                 None => target.current_symbol_index().search(pattern, limit),
             };
             let matched = names.len();
@@ -1129,7 +1138,7 @@ impl Session {
             | std::mem::take(&mut self.unreported_module_change);
         let symbols_changed = match self.target.refresh_kernel_module_symbols() {
             Ok(report) => {
-                let changed = report.loaded != 0 || report.unloaded != 0;
+                let changed = report.loaded != 0 || report.unloaded != 0 || report.deferred != 0;
                 if changed {
                     self.module_refresh_report = Some(report);
                 }

@@ -878,7 +878,7 @@ fn lm(
     #[arg(render, parse = module_display)] display: ModuleDisplay,
     #[arg(parse = module_filter)] filter: ModuleFilter,
 ) -> Result<Vec<ModuleListing>> {
-    list_modules(&session.target, &filter)
+    list_modules(&session.target, &filter, false)
 }
 
 /// Show the detailed symbol status and PDB identity of each module.
@@ -896,11 +896,17 @@ fn lmv(
     #[arg(render, parse = module_details_display)] display: ModuleDisplay,
     #[arg(parse = module_filter)] filter: ModuleFilter,
 ) -> Result<Vec<ModuleListing>> {
-    list_modules(&session.target, &filter)
+    list_modules(&session.target, &filter, true)
 }
 
-/// The modules `filter` selects, with their symbols' state.
-fn list_modules(target: &Target, filter: &ModuleFilter) -> Result<Vec<ModuleListing>> {
+/// The modules `filter` selects, with their symbols' state. `lm` never reads
+/// PE version resources; `lmv` does, and only for the modules its filter has
+/// selected, so a deferred module costs nothing until it is shown verbosely.
+fn list_modules(
+    target: &Target,
+    filter: &ModuleFilter,
+    versions: bool,
+) -> Result<Vec<ModuleListing>> {
     let mut kernel = filter.kernel;
     // An address names its own list: a kernel address is in a kernel
     // module even while a process is selected, as in WinDbg. In the secure
@@ -917,12 +923,12 @@ fn list_modules(target: &Target, filter: &ModuleFilter) -> Result<Vec<ModuleList
         target.process_dtb()
     };
     let modules = if kernel {
-        target.kernel_modules_with_versions()
+        target.kernel_modules()
     } else if filter.user && target.attached_process().is_none() && target.user_modules().is_none()
     {
         Ok(Vec::new())
     } else {
-        target.modules_with_versions()
+        target.modules()
     }
     .map_err(|error| Error::DebugInfo(format!("failed to list modules: {error}")))?;
     let matches = |module: &ModuleInfo| {
@@ -950,9 +956,21 @@ fn list_modules(target: &Target, filter: &ModuleFilter) -> Result<Vec<ModuleList
                 }
             })
     };
-    Ok(modules
+    let mut selected = modules
         .into_iter()
         .filter(|module| matches(module))
+        .collect::<Vec<_>>();
+    if versions {
+        // With no process attached, `modules()` is the kernel list even when
+        // the filter did not say `k`.
+        target
+            .populate_module_versions(&mut selected, kernel || target.attached_process().is_none())
+            .map_err(|error| {
+                Error::DebugInfo(format!("failed to read module versions: {error}"))
+            })?;
+    }
+    Ok(selected
+        .into_iter()
         .map(|module| ModuleListing {
             symbols: target.symbols.module_symbols(dtb, module.base_address),
             module,
@@ -1262,7 +1280,6 @@ fn print_modules(listings: &[ModuleListing], timestamp: bool) {
         "Start".to_string(),
         "End".to_string(),
         "Module".to_string(),
-        "Version".to_string(),
         "Symbols".to_string(),
         "Source".to_string(),
     ];
@@ -1278,7 +1295,6 @@ fn print_modules(listings: &[ModuleListing], timestamp: bool) {
             ui::addr(module.base_address.0).to_string(),
             ui::addr(module.end_address().0).to_string(),
             module.short_name.to_string(),
-            module.file_version.as_deref().unwrap_or("-").to_string(),
             listing
                 .symbols
                 .status

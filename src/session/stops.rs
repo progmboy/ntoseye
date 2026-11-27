@@ -1114,7 +1114,7 @@ impl Session {
             .target
             .load_mapped_module_symbols(process.dtb, module.clone())
         {
-            Ok(Some(report)) if report.loaded == 0 => Some(
+            Ok(Some(report)) if report.loaded == 0 && report.exported == 0 => Some(
                 match self
                     .target
                     .symbols

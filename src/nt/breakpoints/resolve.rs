@@ -23,13 +23,11 @@ impl BreakpointManager {
             skip_prologue: config.skip_prologue,
         };
         let dtb = Self::resolution_dtb(debugger, config.scope.as_ref());
-        let mut address = spec.resolve(debugger, dtb)?;
-        if address.is_none() {
-            let module = symbol.split_once('!').map(|(module, _)| module.trim());
-            if Self::load_scope_symbols(debugger, config.scope.as_ref(), module)? {
-                address = spec.resolve(debugger, dtb)?;
-            }
-        }
+        // Creation never loads a module: `bp`/`bu` keep an unresolved symbol
+        // deferred, as WinDbg does. The module is loaded when the symbol is
+        // actually needed (a module-load reconciliation, `x`, `ln`, a stack
+        // frame), keeping a breakpoint command cheap over KD.
+        let address = spec.resolve(debugger, dtb)?;
         self.add_code_configured(client, debugger, CodeSite::Spec { spec, address }, config)
     }
 
@@ -124,21 +122,39 @@ impl BreakpointManager {
         BreakpointSpec::resolve_symbol_offset(debugger, dtb, name)
     }
 
-    /// A process-scoped specification that did not resolve: read that
-    /// process's loader list and load the named module's symbols (or all of
-    /// them for a source line), so `bu /p <pid> user32!X` works without a
-    /// prior `.process /p`. Returns whether anything new was loaded. Kernel
-    /// and unscoped specifications resolve against what is loaded; a miss
-    /// there really is deferred until the module appears.
+    /// A specification that did not resolve: load only the module it names,
+    /// as WinDbg's deferred symbols do. A process scope reads that process's
+    /// loader list (all its modules for a source line); kernel and unscoped
+    /// specifications read the current kernel/process module list. Returns
+    /// whether anything new was loaded.
     fn load_scope_symbols(
         debugger: &Target,
         scope: Option<&BreakpointScope>,
         module_short: Option<&str>,
     ) -> Result<bool> {
-        let Some(BreakpointScope::Process { pid, dtb, .. }) = scope else {
-            return Ok(false);
-        };
-        debugger.load_process_module_symbols(*pid, *dtb, module_short)
+        match scope {
+            Some(BreakpointScope::Process { pid, dtb, .. }) => {
+                debugger.load_process_module_symbols(*pid, *dtb, module_short)
+            }
+            Some(BreakpointScope::Kernel) => match module_short {
+                // A test session or a bare-memory target has no kernel to
+                // load from; the breakpoint stays deferred instead of
+                // failing the command.
+                Some(module) => Ok(debugger
+                    .load_current_module_symbols(module)
+                    .unwrap_or(false)),
+                None => Ok(false),
+            },
+            None => match module_short {
+                Some(module) => Ok(debugger
+                    .load_current_module_symbols(module)
+                    .unwrap_or(false)),
+                // An unqualified kernel symbol stays deferred until a later
+                // module load, as WinDbg leaves it; loading every module
+                // would make one `bp` walk the whole module list over KD.
+                None => Ok(false),
+            },
+        }
     }
 
     /// Keep symbolic code breakpoints across a target rebuild while dropping
@@ -324,7 +340,24 @@ impl BreakpointManager {
                 Error::Breakpoint(format!("breakpoint {id} lost its specification"))
             })?;
             let dtb = Self::resolution_dtb(debugger, Some(&snapshot.scope));
-            let resolved = spec.resolve(debugger, dtb)?;
+            let resolved = match spec.resolve(debugger, dtb)? {
+                Some(address) => Some(address),
+                None => {
+                    // A module load can make a deferred breakpoint resolve:
+                    // load only the module the specification names, as WinDbg
+                    // does, then retry this one specification.
+                    if let BreakpointSpec::Symbol { name, .. } = spec {
+                        let module = name.split_once('!').map(|(module, _)| module.trim());
+                        if Self::load_scope_symbols(debugger, Some(&snapshot.scope), module)? {
+                            spec.resolve(debugger, dtb)?
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
             let scope = resolved
                 .filter(|_| snapshot.automatic_scope)
                 .map(|address| Self::scope_for_address(debugger, address, &snapshot.scope))

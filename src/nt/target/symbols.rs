@@ -103,23 +103,32 @@ impl Target {
 
     pub fn modules_with_versions(&self) -> Result<Vec<ModuleInfo>> {
         let mut mods = self.modules()?;
+        self.populate_module_versions(&mut mods, self.process.is_none())?;
+        Ok(mods)
+    }
+
+    /// Fill the PE version strings of `modules`, the caller's already-filtered
+    /// set. `lm` does not ask for them; `lmv` does, and only for the modules
+    /// it will print.
+    pub fn populate_module_versions(&self, modules: &mut [ModuleInfo], kernel: bool) -> Result<()> {
         if self.in_secure_address_space() {
             let memory = self.process_memory();
-            for module in &mut mods {
+            for module in modules {
                 if let Some((file, product)) = read_pe_version_info(module.base_address, &memory) {
                     module.file_version = Some(file);
                     module.product_version = Some(product);
                 }
             }
-            return Ok(mods);
+            return Ok(());
         }
-        if let Ok(g) = self.guest() {
-            match &self.process {
-                Some(info) => g.populate_process_module_versions(&mut mods, info),
-                None => g.populate_kernel_module_versions(&mut mods),
+        if let Ok(guest) = self.guest() {
+            if kernel {
+                guest.populate_kernel_module_versions(modules);
+            } else if let Some(info) = &self.process {
+                guest.populate_process_module_versions(modules, info);
             }
         }
-        Ok(mods)
+        Ok(())
     }
 
     fn triage_modules(&self) -> Result<Vec<ModuleInfo>> {
@@ -251,9 +260,10 @@ impl Target {
                 module_short.is_none_or(|short| glob_matches(short, &module.short_name, true))
             })
             .filter(|module| {
-                self.symbols
-                    .module_symbol_status(dtb, module.base_address)
-                    .is_none()
+                matches!(
+                    self.symbols.module_symbol_status(dtb, module.base_address),
+                    None | Some(crate::nt::symbols::ModuleSymbolStatus::Deferred)
+                )
             })
             .collect();
         if modules.is_empty() {
@@ -264,7 +274,7 @@ impl Target {
             &self.symbols,
             modules,
             dtb,
-            PdbRecovery::Automatic,
+            PdbRecovery::OnDemand,
         )?;
         Ok(true)
     }
@@ -278,11 +288,10 @@ impl Target {
         dtb: Dtb,
         module: ModuleInfo,
     ) -> Result<Option<ModuleSymbolLoadReport>> {
-        if self
-            .symbols
-            .module_symbol_status(dtb, module.base_address)
-            .is_some()
-        {
+        if !matches!(
+            self.symbols.module_symbol_status(dtb, module.base_address),
+            None | Some(crate::nt::symbols::ModuleSymbolStatus::Deferred)
+        ) {
             return Ok(None);
         }
         self.guest()?
@@ -291,7 +300,7 @@ impl Target {
                 &self.symbols,
                 vec![module],
                 dtb,
-                PdbRecovery::Automatic,
+                PdbRecovery::OnDemand,
             )
             .map(Some)
     }
@@ -385,8 +394,59 @@ impl Target {
         }
     }
 
+    /// Load the symbols of one named module, the WinDbg deferred-load half of
+    /// a `module!symbol` query. Only a module that is still `Deferred` (or
+    /// has no status yet) is loaded; a loaded or failed module is left alone
+    /// until `.reload`.
+    pub fn load_current_module_symbols(&self, module_short: &str) -> Result<bool> {
+        // Kernel modules resolve in every process context. Try them first so
+        // `bp nt!...` does not go looking for a user module called `nt`.
+        if self
+            .load_kernel_module_symbols(module_short)
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+        match &self.process {
+            Some(process) => {
+                self.load_process_module_symbols(process.pid, process.dtb, Some(module_short))
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn load_kernel_module_symbols(&self, module_short: &str) -> Result<bool> {
+        let guest = self.guest()?;
+        let dtb = self.kernel_dtb();
+        let modules = self
+            .kernel_modules()?
+            .into_iter()
+            .filter(|module| module.short_name.eq_ignore_ascii_case(module_short))
+            .filter(|module| {
+                matches!(
+                    self.symbols.module_symbol_status(dtb, module.base_address),
+                    None | Some(crate::nt::symbols::ModuleSymbolStatus::Deferred)
+                )
+            })
+            .collect::<Vec<_>>();
+        if modules.is_empty() {
+            return Ok(false);
+        }
+        guest.load_symbols_for_modules(
+            &self.phys,
+            &self.symbols,
+            modules,
+            dtb,
+            PdbRecovery::OnDemand,
+        )?;
+        Ok(true)
+    }
+
     /// All matching symbol identities visible from the active address space.
     pub fn symbol_candidates(&self, name: &str) -> Vec<SymbolCandidate> {
+        if let Some((module, _)) = split_query_module(name) {
+            let _ = self.load_current_module_symbols(module);
+        }
         self.symbols
             .find_symbol_candidates(self.current_dtb(), name)
     }
@@ -397,9 +457,11 @@ impl Target {
     pub fn search_symbols(&self, query: &str, limit: usize) -> Vec<SymbolSearchMatch> {
         let dtb = self.current_dtb();
         let names: Vec<String> = match split_query_module(query) {
-            Some((module, query)) => self
-                .symbols
-                .search_symbols_in_modules(dtb, module, query, limit),
+            Some((module, query)) => {
+                let _ = self.load_current_module_symbols(module);
+                self.symbols
+                    .search_symbols_in_modules(dtb, module, query, limit)
+            }
             None => self.current_symbol_index().search(query, limit),
         };
         self.symbol_matches(names)
@@ -442,7 +504,40 @@ impl Target {
         &self,
         address: VirtAddr,
     ) -> Option<(String, String, u32)> {
+        self.ensure_module_for_address(address);
         crate::nt::unwind::nearest_symbol(self, self.current_dtb(), address)
+    }
+
+    /// Load the module containing `address` if its symbols are still
+    /// deferred. This is the address-to-symbol half of WinDbg's on-demand
+    /// load (`ln`, `u`, source lookup); a failed lookup leaves the address
+    /// rendering as `module+offset`.
+    fn ensure_module_for_address(&self, address: VirtAddr) {
+        let dtb = self.current_dtb();
+        if self.symbols.find_module_for_address(dtb, address).is_some() {
+            return;
+        }
+        let deferred = |module: &ModuleInfo| {
+            matches!(
+                self.symbols.module_symbol_status(dtb, module.base_address),
+                None | Some(crate::nt::symbols::ModuleSymbolStatus::Deferred)
+            )
+        };
+        if let Ok(modules) = self.kernel_modules()
+            && let Some(module) = modules
+                .into_iter()
+                .find(|module| module.contains_address(address) && deferred(module))
+        {
+            let _ = self.load_kernel_module_symbols(&module.short_name);
+            return;
+        }
+        if let Ok(modules) = self.modules()
+            && let Some(module) = modules
+                .into_iter()
+                .find(|module| module.contains_address(address) && deferred(module))
+        {
+            let _ = self.load_current_module_symbols(&module.short_name);
+        }
     }
 
     pub fn closest_symbol_current_context(&self, address: VirtAddr) -> Option<String> {

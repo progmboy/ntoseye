@@ -99,11 +99,15 @@ impl Target {
 
         // A triage dump seldom holds PsLoadedModuleList even when it holds
         // the kernel; its driver list names the modules then, as it does for
-        // `kernel_modules()`.
+        // `kernel_modules()`. Live targets only register deferred modules;
+        // offline dumps keep their symbols ready for analysis.
         let loaded = guest.as_ref().is_some_and(|guest| {
-            guest
-                .load_all_kernel_module_symbols(&phys, &symbols)
-                .is_ok()
+            if phys.dmp_info().is_some() {
+                guest.load_all_kernel_module_symbols(&phys, &symbols)
+            } else {
+                guest.register_kernel_module_symbols(&symbols)
+            }
+            .is_ok()
         });
         if !loaded && let Some(modules) = &triage_modules {
             let arch = phys
@@ -151,7 +155,7 @@ impl Target {
                 arch,
             },
         )?;
-        let _ = guest.load_all_kernel_module_symbols(&phys, &symbols);
+        let _ = guest.register_kernel_module_symbols(&symbols);
         Ok(Self::from_parts(
             phys,
             symbols,
@@ -167,7 +171,7 @@ impl Target {
     pub fn with_kernel_dtb(phys: Arc<PhysMem>, kernel_dtb: Dtb) -> Result<Self> {
         let symbols = Arc::new(SymbolStore::new());
         let guest = Guest::new_with_dtb(phys.clone(), symbols.clone(), kernel_dtb)?;
-        let _ = guest.load_all_kernel_module_symbols(&phys, &symbols);
+        let _ = guest.register_kernel_module_symbols(&symbols);
         Ok(Self::from_parts(
             phys,
             symbols,
@@ -374,7 +378,7 @@ impl Target {
         self.symbols.clear_synthetic_modules();
 
         let (symbol_report, symbol_error) =
-            match guest.load_all_kernel_module_symbols(&self.phys, &self.symbols) {
+            match guest.register_kernel_module_symbols(&self.symbols) {
                 Ok(report) => (Some(report), None),
                 Err(e) => (None, Some(e.to_string())),
             };

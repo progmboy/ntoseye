@@ -211,10 +211,12 @@ pub(super) fn ensure_module_symbols(
         }
         let key = (module.dtb, module.info.base_address.0);
         if seen.insert(key)
-            && debugger
-                .symbols
-                .module_symbol_status(module.dtb, module.info.base_address)
-                .is_none()
+            && matches!(
+                debugger
+                    .symbols
+                    .module_symbol_status(module.dtb, module.info.base_address),
+                None | Some(crate::nt::symbols::ModuleSymbolStatus::Deferred)
+            )
         {
             by_dtb.entry(module.dtb).or_default().push(module.info);
         }

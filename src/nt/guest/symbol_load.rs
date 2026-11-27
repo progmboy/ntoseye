@@ -34,8 +34,14 @@ impl ModuleSymbolLoadReport {
 
     fn record_status(&mut self, status: &ModuleSymbolStatus) {
         match status {
+            ModuleSymbolStatus::Deferred => {
+                self.deferred += 1;
+            }
             ModuleSymbolStatus::Loaded => {
                 self.loaded += 1;
+            }
+            ModuleSymbolStatus::Exports => {
+                self.exported += 1;
             }
             ModuleSymbolStatus::MissingDebugInfo => {
                 self.no_pdb += 1;
@@ -76,8 +82,10 @@ impl ModuleSymbolLoadReport {
         self.loaded += other.loaded;
         self.unloaded += other.unloaded;
         self.no_pdb += other.no_pdb;
+        self.exported += other.exported;
         self.skipped += other.skipped;
         self.failed += other.failed;
+        self.deferred += other.deferred;
         self.fetching += other.fetching;
         self.diagnostic_count += other.diagnostic_count;
         self.diagnostics.extend(other.diagnostics);
@@ -194,6 +202,11 @@ impl Guest {
         recovery: PdbRecovery,
     ) -> Result<ModuleSymbolLoadReport> {
         let mut report = ModuleSymbolLoadReport::new(modules.len());
+        // On a query, read an export table only after the PDB attempt fails:
+        // WinDbg tries the PDB first and falls back to exports, so a module
+        // with a PDB never pays for its export table.
+        let export_candidates = matches!(recovery, PdbRecovery::OnDemand | PdbRecovery::Requested)
+            .then(|| modules.clone());
         let plan = Self::plan_module_symbol_loads(
             phys,
             symbols,
@@ -222,6 +235,9 @@ impl Guest {
                 arch,
                 recovery,
             )?);
+        }
+        if let Some(modules) = export_candidates {
+            Self::load_export_fallbacks(phys, symbols, modules, dtb, arch, &mut report);
         }
 
         Ok(report)
@@ -254,7 +270,7 @@ impl Guest {
             dtb,
             &SessionSpace::Load,
             arch,
-            PdbRecovery::Automatic,
+            PdbRecovery::OnDemand,
             &mut report,
         );
         let mut deferred = plan.take_fetches();
@@ -270,7 +286,7 @@ impl Guest {
                 dtb,
                 &SessionSpace::Load,
                 arch,
-                PdbRecovery::Automatic,
+                PdbRecovery::OnDemand,
                 &mut report,
             );
             deferred.absorb(replan.take_fetches());
@@ -375,6 +391,12 @@ impl Guest {
         // Loads whose PDB no local source has, to rebuild from guest memory
         // in one walk after every module is planned.
         let mut from_memory = Vec::new();
+        // An image's export table is a large read while the target is
+        // halted. Read it ahead only where guest memory is cheap — a host
+        // mapping or a dump. Over KD the module stays `Deferred` (or resolves
+        // from its PDB); `load_export_fallbacks` reads the table after a PDB
+        // attempt fails, as WinDbg does, and only for the queried module.
+        let preload_exports = !phys.reads_through_target();
 
         for module in modules {
             let session = Self::is_session_space(module.base_address);
@@ -422,7 +444,7 @@ impl Guest {
                 Ok(ModuleSymbolDiscovery::Ready { job, guid, source }) => {
                     let mut load = ModuleSymbolLoad::new(job, guid, source, module, dtb);
                     let ready = plan.is_ready(symbols, &load);
-                    if !ready {
+                    if !ready && preload_exports {
                         // The PDB must be fetched or rebuilt, and may not
                         // exist anywhere: read the export table now, while
                         // guest memory is reachable from this thread, as the
@@ -456,7 +478,11 @@ impl Guest {
                 Ok(ModuleSymbolDiscovery::NeedsImage { image_job }) => {
                     // Memory names no PDB: if the image does not either, or
                     // cannot be fetched, its export table is all there is.
-                    let exports = Self::read_export_fallback(phys, image_dtb, arch, &module);
+                    let exports = if preload_exports {
+                        Self::read_export_fallback(phys, image_dtb, arch, &module)
+                    } else {
+                        None
+                    };
                     match unavailable(&image_job) {
                         Some(status) => {
                             Self::publish_image_export_fallback(
@@ -592,6 +618,58 @@ impl Guest {
         .ok()?;
         let exports = read_pe_exports(&image, module.base_address).ok()?;
         (!exports.exports.is_empty()).then_some(exports.exports)
+    }
+
+    /// Read the export table of every candidate whose PDB attempt left it
+    /// without symbols, on the thread that owns guest memory. A module that
+    /// found a PDB is skipped; one that already has export symbols is skipped.
+    fn load_export_fallbacks(
+        phys: &Arc<PhysMem>,
+        symbols: &SymbolStore,
+        modules: Vec<ModuleInfo>,
+        dtb: Dtb,
+        arch: Arch,
+        report: &mut ModuleSymbolLoadReport,
+    ) {
+        let mut seen = HashSet::new();
+        for module in modules {
+            if !seen.insert(module.base_address) {
+                continue;
+            }
+            if matches!(
+                symbols.module_symbol_status(dtb, module.base_address),
+                Some(
+                    ModuleSymbolStatus::Loaded
+                        | ModuleSymbolStatus::Exports
+                        | ModuleSymbolStatus::Skipped
+                        | ModuleSymbolStatus::Fetching
+                )
+            ) {
+                continue;
+            }
+            let Some(exports) = Self::read_export_fallback(phys, dtb, arch, &module) else {
+                continue;
+            };
+            // The module moved from "no PDB" or "failed" to export symbols;
+            // keep the report's categories exclusive.
+            match symbols.module_symbol_status(dtb, module.base_address) {
+                Some(ModuleSymbolStatus::MissingDebugInfo) => {
+                    report.no_pdb = report.no_pdb.saturating_sub(1);
+                }
+                Some(ModuleSymbolStatus::Failed(_)) => {
+                    report.failed = report.failed.saturating_sub(1);
+                }
+                _ => {}
+            }
+            Self::publish_image_export_fallback(symbols, dtb, &module, Some(&exports));
+            Self::apply_module_symbol_status(
+                symbols,
+                report,
+                dtb,
+                &module,
+                ModuleSymbolStatus::Exports,
+            );
+        }
     }
 
     /// Index a module's stashed exports when its PDB could not be acquired:
@@ -826,6 +904,53 @@ impl Guest {
         stale_identities
     }
 
+    /// Register the kernel's modules without reading their symbols.
+    ///
+    /// This is the attach and module-refresh half of WinDbg's deferred
+    /// loading: each module gets a `Deferred` status, and the first query for
+    /// its name (or an address in it) loads only that module.
+    pub fn register_kernel_module_symbols(
+        &self,
+        symbols: &SymbolStore,
+    ) -> Result<ModuleSymbolLoadReport> {
+        let mut modules = self.kernel_modules()?;
+        if !modules
+            .iter()
+            .any(|module| module.base_address == self.ntoskrnl.base_address)
+        {
+            let size = self.ntoskrnl.binary_size().try_into().unwrap_or(u32::MAX);
+            if size != 0 {
+                modules.insert(
+                    0,
+                    ModuleInfo::new("ntoskrnl.exe".to_string(), self.ntoskrnl.base_address, size),
+                );
+            }
+        }
+        let dtb = self.ntoskrnl.dtb();
+        let mut report = ModuleSymbolLoadReport::new(modules.len());
+        let mut seen = HashSet::new();
+        for module in modules {
+            if !seen.insert(module.base_address) {
+                continue;
+            }
+            if symbols
+                .module_symbol_status(dtb, module.base_address)
+                .is_none()
+            {
+                Self::apply_module_symbol_status(
+                    symbols,
+                    &mut report,
+                    dtb,
+                    &module,
+                    ModuleSymbolStatus::Deferred,
+                );
+            }
+        }
+        Ok(report)
+    }
+
+    /// Load every kernel module now. Used for offline targets and explicit
+    /// reloads; live targets register deferred modules instead.
     pub fn load_all_kernel_module_symbols(
         &self,
         phys: &Arc<PhysMem>,
@@ -909,9 +1034,11 @@ impl Guest {
             .collect()
     }
 
+    /// Register modules that appeared since the previous stop as deferred.
+    /// No symbol file or export table is read; the first query loads one.
     pub fn load_missing_kernel_module_symbols(
         &self,
-        phys: &Arc<PhysMem>,
+        _phys: &Arc<PhysMem>,
         symbols: &SymbolStore,
     ) -> Result<ModuleSymbolLoadReport> {
         let dtb = self.ntoskrnl.dtb();
@@ -930,17 +1057,52 @@ impl Guest {
             })
             .collect::<Vec<_>>();
 
-        let session_space = self.kernel_session_space(dtb, &missing, SessionSpace::Skip);
-        let mut report = Self::load_module_symbols(
-            phys,
-            symbols,
-            missing,
-            dtb,
-            session_space,
-            self.ntoskrnl.arch(),
-            PdbRecovery::Automatic,
-        )?;
+        let mut report = ModuleSymbolLoadReport::new(missing.len());
+        let mut seen = HashSet::new();
+        for module in missing {
+            if !seen.insert(module.base_address) {
+                continue;
+            }
+            Self::apply_module_symbol_status(
+                symbols,
+                &mut report,
+                dtb,
+                &module,
+                ModuleSymbolStatus::Deferred,
+            );
+        }
         report.unloaded = unloaded;
+        Ok(report)
+    }
+
+    /// Register a process's modules without reading any symbol files, the
+    /// user-mode half of WinDbg's deferred loading.
+    pub fn register_process_module_symbols(
+        &self,
+        symbols: &SymbolStore,
+        info: &ProcessInfo,
+    ) -> Result<ModuleSymbolLoadReport> {
+        let modules = self.process_modules(info)?;
+        let dtb = info.dtb;
+        let mut report = ModuleSymbolLoadReport::new(modules.len());
+        let mut seen = HashSet::new();
+        for module in modules {
+            if !seen.insert(module.base_address) {
+                continue;
+            }
+            if symbols
+                .module_symbol_status(dtb, module.base_address)
+                .is_none()
+            {
+                Self::apply_module_symbol_status(
+                    symbols,
+                    &mut report,
+                    dtb,
+                    &module,
+                    ModuleSymbolStatus::Deferred,
+                );
+            }
+        }
         Ok(report)
     }
 

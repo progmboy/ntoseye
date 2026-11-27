@@ -225,13 +225,16 @@ pub enum PdbRecovery {
     /// While guest memory is read from the host, where the walk is cheap:
     /// loads at attach and at stops.
     Automatic,
+    /// A symbol query: try the PDB, then read the queried module's export
+    /// table if no PDB exists; do not rebuild a PDB from guest memory.
+    OnDemand,
     /// Whatever the memory source: an explicit reload of the module.
     Requested,
 }
 
-/// The result of a symbol reload. It counts the modules that loaded, had
-/// no PDB, were skipped, failed, or are still being fetched, and keeps the
-/// first diagnostics up to a limit.
+/// The result of a symbol pass. It counts modules registered as deferred,
+/// loaded, resolved from exports, without a PDB, skipped, failed, or still
+/// being fetched, and keeps the first diagnostics up to a limit.
 #[record]
 #[derive(Debug, Clone, Default)]
 pub struct ModuleSymbolLoadReport {
@@ -240,8 +243,13 @@ pub struct ModuleSymbolLoadReport {
     /// The number of modules with symbols that unloaded after the previous refresh.
     pub unloaded: usize,
     pub no_pdb: usize,
+    /// Loaded from a module's export table instead of a PDB.
+    pub exported: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Registered with the module list but not loaded yet; its symbols load
+    /// on the first query, as WinDbg's deferred symbols do.
+    pub deferred: usize,
     /// Handed to the background fetcher; not yet loaded or failed.
     pub fetching: usize,
     /// The number of all diagnostics, including those after the limit of `diagnostics`.

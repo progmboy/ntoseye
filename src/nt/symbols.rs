@@ -726,7 +726,12 @@ struct PdbRequest {
 
 #[derive(Debug, Clone)]
 pub enum ModuleSymbolStatus {
+    /// Registered, not loaded: the module's symbols are read on first use,
+    /// as WinDbg's `(deferred)` modules are.
+    Deferred,
     Loaded,
+    /// The module has no PDB, so its named exports are its symbols.
+    Exports,
     MissingDebugInfo,
     Skipped,
     Failed(#[allow(dead_code)] String),
@@ -740,7 +745,9 @@ impl ModuleSymbolStatus {
     /// The status without the failure reason.
     pub fn kind(&self) -> SymbolStatus {
         match self {
+            Self::Deferred => SymbolStatus::Deferred,
             Self::Loaded => SymbolStatus::Loaded,
+            Self::Exports => SymbolStatus::Exports,
             Self::MissingDebugInfo => SymbolStatus::NoPdb,
             Self::Skipped => SymbolStatus::Skipped,
             Self::Failed(_) => SymbolStatus::Failed,
@@ -750,7 +757,9 @@ impl ModuleSymbolStatus {
 
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Deferred => "deferred",
             Self::Loaded => "loaded",
+            Self::Exports => "export",
             Self::MissingDebugInfo => "no-pdb",
             Self::Skipped => "skipped",
             Self::Failed(_) => "failed",
@@ -759,12 +768,14 @@ impl ModuleSymbolStatus {
     }
 }
 
-/// The symbol state of a module: `loaded`, `no_pdb`, `skipped`, `failed`,
-/// `fetching` or `unknown`.
+/// The symbol state of a module: `deferred`, `loaded`, `exports`, `no_pdb`,
+/// `skipped`, `failed`, `fetching` or `unknown`.
 #[record]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolStatus {
+    Deferred,
     Loaded,
+    Exports,
     #[record(label = "no-pdb")]
     NoPdb,
     Skipped,

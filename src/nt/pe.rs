@@ -686,6 +686,10 @@ fn read_image_c_string(image: &PeImage, rva: u32, what: &str) -> Result<String> 
 pub fn read_pe_exports(image: &PeImage, base: VirtAddr) -> Result<ImageExports> {
     const DIRECTORY_SIZE: usize = 40;
     const MAX_EXPORTS: usize = 1_000_000;
+    // WinDbg's dbghelp reads the export directory as one buffer and parses
+    // every name locally. Cap the buffer so a corrupt Size cannot allocate
+    // the whole address space; larger directories fall back to table reads.
+    const MAX_BUFFERED_EXPORT: usize = 16 * 1024 * 1024;
 
     let headers = PeView::from_bytes(image.headers())?;
     let Some(entry) = headers
@@ -706,10 +710,54 @@ pub fn read_pe_exports(image: &PeImage, base: VirtAddr) -> Result<ImageExports> 
              IMAGE_EXPORT_DIRECTORY ({DIRECTORY_SIZE:#x})"
         )));
     }
-    let data = read_image_bytes(image, directory_rva, DIRECTORY_SIZE, "export directory")?;
+
+    let block_start = directory_rva as usize;
+    let block_end = block_start.saturating_add(directory_size as usize);
+    let directory_block = (directory_size as usize <= MAX_BUFFERED_EXPORT
+        && block_end <= image.size)
+        .then(|| {
+            read_image_bytes(
+                image,
+                directory_rva,
+                directory_size as usize,
+                "export directory",
+            )
+            .ok()
+            .map(std::borrow::Cow::into_owned)
+        })
+        .flatten();
+
+    let read_rva = |rva: u32, len: usize, what: &str| -> Result<Vec<u8>> {
+        let start = rva as usize;
+        let end = start.checked_add(len);
+        if let (Some(block), Some(end)) = (&directory_block, end)
+            && start >= block_start
+            && end <= block_end
+        {
+            return Ok(block[start - block_start..end - block_start].to_vec());
+        }
+        Ok(read_image_bytes(image, rva, len, what)?.into_owned())
+    };
+    let read_name = |rva: u32, what: &str| -> Result<String> {
+        let start = rva as usize;
+        if let Some(block) = &directory_block
+            && start >= block_start
+            && start < block_end
+        {
+            let tail = &block[start - block_start..];
+            if let Some(end) = tail.iter().position(|byte| *byte == 0)
+                && end < 4096
+            {
+                return Ok(String::from_utf8_lossy(&tail[..end]).into_owned());
+            }
+        }
+        read_image_c_string(image, rva, what)
+    };
+
+    let data = read_rva(directory_rva, DIRECTORY_SIZE, "export directory")?;
     let u32_at = |offset| read_u32(&data, offset);
     let directory = ExportDirectory {
-        name: read_image_c_string(image, u32_at(12), "export DLL name")?,
+        name: read_name(u32_at(12), "export DLL name")?,
         characteristics: u32_at(0),
         time_date_stamp: u32_at(4),
         version: (read_u16(&data, 8), read_u16(&data, 10)),
@@ -729,20 +777,17 @@ pub fn read_pe_exports(image: &PeImage, base: VirtAddr) -> Result<ImageExports> 
         ));
     }
 
-    let functions = read_image_bytes(
-        image,
+    let functions = read_rva(
         directory.address_of_functions,
         function_count * 4,
         "export address table",
     )?;
-    let names = read_image_bytes(
-        image,
+    let names = read_rva(
         directory.address_of_names,
         name_count * 4,
         "export name table",
     )?;
-    let ordinals = read_image_bytes(
-        image,
+    let ordinals = read_rva(
         directory.address_of_name_ordinals,
         name_count * 2,
         "export ordinal table",
@@ -759,7 +804,7 @@ pub fn read_pe_exports(image: &PeImage, base: VirtAddr) -> Result<ImageExports> 
         names_by_function
             .entry(function_index)
             .or_default()
-            .push(read_image_c_string(image, name_rva, "export name")?);
+            .push(read_name(name_rva, "export name")?);
     }
 
     let mut exports = Vec::new();
@@ -773,7 +818,7 @@ pub fn read_pe_exports(image: &PeImage, base: VirtAddr) -> Result<ImageExports> 
             .checked_add(index as u32)
             .ok_or_else(|| Error::DebugInfo("PE export ordinal overflow".into()))?;
         let forwarder = (function_rva >= directory_rva && function_rva < forwarder_end)
-            .then(|| read_image_c_string(image, function_rva, "export forwarder"))
+            .then(|| read_name(function_rva, "export forwarder"))
             .transpose()?;
         let rva = forwarder.is_none().then_some(function_rva);
         let address = rva.map(|rva| VirtAddr(base.0.saturating_add(u64::from(rva))));

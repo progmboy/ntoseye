@@ -168,6 +168,12 @@ pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
     if report.failed_count() > 0 {
         summary.push_str(&format!(", {} failed", report.failed_count()));
     }
+    if report.exported > 0 {
+        summary.push_str(&format!(", {} export symbols", report.exported));
+    }
+    if report.deferred > 0 {
+        summary.push_str(&format!(", {} deferred", report.deferred));
+    }
     if report.no_pdb > 0 {
         summary.push_str(&format!(", {} no-pdb", report.no_pdb));
     }
